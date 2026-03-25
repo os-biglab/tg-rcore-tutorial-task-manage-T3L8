@@ -7,7 +7,7 @@
 
 #![no_std]
 #![deny(warnings, missing_docs)]
-#![allow(snake_case)]
+#![allow(non_snake_case)]
 
 extern crate alloc;
 
