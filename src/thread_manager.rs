@@ -117,6 +117,11 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
         let id = self.current.unwrap();
         self.manager.as_mut().unwrap().get_mut(id)
     }
+    /// 当前线程 Id
+    #[inline]
+    pub fn current_tid(&self) -> Option<ThreadId> {
+        self.current
+    }
     /// 获取某个线程
     #[inline]
     pub fn get_task(&mut self, id: ThreadId) -> Option<&mut T> {
@@ -139,20 +144,38 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
         // 删除进程实体
         self.proc_manager.as_mut().unwrap().delete(id);
         // 进程结束时维护父子关系，进程删除后，所有的子进程交给 0 号进程来维护
-        let current_rel = self.rel_map.remove(&id).unwrap();
+        let Some(current_rel) = self.rel_map.remove(&id) else {
+            // 兜底：关系项缺失时，尽量在父子表中清理并投递 dead_child，避免 waitpid 永久等待。
+            for rel in self.rel_map.values_mut() {
+                rel.del_child(id, exit_code);
+            }
+            return;
+        };
         let parent_pid = current_rel.parent;
         let children = current_rel.children;
         // 从父进程中删除当前进程
         if let Some(parent_rel) = self.rel_map.get_mut(&parent_pid) {
             parent_rel.del_child(id, exit_code);
         }
+
+        // 优先将孤儿进程交给 0 号进程；若 0 号进程不存在，则退化交给父进程；
+        // 两者都不存在时，仅更新 child 的 parent 字段，不再强制挂接，避免 panic。
+        let adopt_pid = if self.rel_map.contains_key(&ProcId::from_usize(0)) {
+            Some(ProcId::from_usize(0))
+        } else if self.rel_map.contains_key(&parent_pid) {
+            Some(parent_pid)
+        } else {
+            None
+        };
+
         // 把当前进程的所有子进程转移到 0 号进程
         for i in children {
-            self.rel_map.get_mut(&i).unwrap().parent = ProcId::from_usize(0);
-            self.rel_map
-                .get_mut(&ProcId::from_usize(0))
-                .unwrap()
-                .add_child(i);
+            if let Some(rel) = self.rel_map.get_mut(&i) {
+                rel.parent = adopt_pid.unwrap_or(parent_pid);
+            }
+            if let Some(adopter) = adopt_pid.and_then(|pid| self.rel_map.get_mut(&pid)) {
+                adopter.add_child(i);
+            }
         }
     }
     /// wait 系统调用，返回结束的子进程 id 和 exit_code，正在运行的子进程不返回 None，返回 (-2, -1)
