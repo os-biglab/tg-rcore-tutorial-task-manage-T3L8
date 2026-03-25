@@ -15,3 +15,5 @@ categories = ["no-std", "embedded"]
 [features]
 proc = []
 thread = []
+
+[workspace]
