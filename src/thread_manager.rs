@@ -77,18 +77,13 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
             self.manager.as_mut().unwrap().delete(id);
             // 线程结束时维护与父进程之间的关系
             let pid = self.tid2pid.remove(&id).unwrap();
-            let mut flag = false;
             if let Some(current_rel) = self.rel_map.get_mut(&pid) {
                 current_rel.del_thread(id, exit_code);
-                // 如果线程数量为 0，则需要把当前线程所属的进程给删除掉（所有等待的线程都已经结束）
-                if current_rel.threads.is_empty() {
-                    flag = true;
-                }
             }
-            if flag {
-                // 教学语义：最后一个线程退出时，进程对象也随之清理。
-                self.del_proc(pid, exit_code);
-            }
+            // 注意：多核场景下同一进程的线程可能分布在不同核。
+            // 不能由“某个核的本地关系表线程数归零”来判断全局进程已结束，
+            // 否则会过早删除 owner 核进程实体，导致其它核仍在运行的线程访问进程失败。
+            // 统一交由上层全局生命周期管理（processor::unregister_thread）在全局线程计数归零后回收进程。
             self.current = None;
         }
     }
@@ -106,11 +101,16 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
     pub fn add(&mut self, id: ThreadId, task: T, pid: ProcId) {
         self.manager.as_mut().unwrap().insert(id, task);
         self.manager.as_mut().unwrap().add(id);
-        // 增加线程与进程之间的从属关系
+        // 增加线程与进程之间的从属关系。
+        // 在多核分发场景下，目标核可能没有该 pid 对应的进程实体，
+        // 但依然需要关系项用于线程生命周期与 waittid 语义。
+        if !self.rel_map.contains_key(&pid) {
+            self.rel_map.insert(pid, ProcThreadRel::new(ProcId::from_usize(usize::MAX)));
+        }
         if let Some(parent_rel) = self.rel_map.get_mut(&pid) {
             parent_rel.add_thread(id);
-            self.tid2pid.insert(id, pid);
         }
+        self.tid2pid.insert(id, pid);
     }
     /// 当前线程
     pub fn current(&mut self) -> Option<&mut T> {
@@ -197,6 +197,13 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
         let current_rel = self.rel_map.get_mut(pid).unwrap();
         current_rel.wait_thread(thread_tid)
     }
+
+    /// 按指定 pid 查询/回收线程退出码（用于跨核 waittid 聚合）
+    pub fn waittid_by_pid(&mut self, pid: ProcId, thread_tid: ThreadId) -> Option<isize> {
+        self.rel_map
+            .get_mut(&pid)
+            .and_then(|rel| rel.wait_thread(thread_tid))
+    }
     /// 某个进程的线程数量
     pub fn thread_count(&self, id: ProcId) -> usize {
         self.rel_map.get(&id).unwrap().threads.len()
@@ -208,8 +215,10 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
     /// 获取当前线程所属的进程
     pub fn get_current_proc(&mut self) -> Option<&mut P> {
         if let Some(id) = self.current {
-            let pid = self.tid2pid.get(&id).unwrap();
-            self.proc_manager.as_mut().unwrap().get_mut(*pid)
+            self.tid2pid
+                .get(&id)
+                .copied()
+                .and_then(|pid| self.proc_manager.as_mut().unwrap().get_mut(pid))
         } else {
             None
         }
